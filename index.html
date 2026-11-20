@@ -22,6 +22,7 @@ button,select,input,textarea{font:inherit;color:var(--tx)}
 .chip.on{background:var(--ac);color:#fff;border-color:var(--ac)}
 .btn{background:var(--ac);color:#fff;border:0;border-radius:10px;padding:10px 16px;cursor:pointer;font-weight:600;display:inline-block;text-decoration:none}
 .btn.ghost{background:none;color:var(--ac);border:1px solid var(--ac)}
+.btn[disabled]{opacity:.6;cursor:wait}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:12px;margin-bottom:10px;display:flex;gap:12px;cursor:pointer}
 .card img,.ph{width:84px;height:84px;object-fit:cover;border-radius:10px;background:var(--bd);flex:none}
 .score{font-weight:700;font-size:20px}
@@ -51,7 +52,7 @@ input[type=text],select,textarea{width:100%;padding:9px;border:1px solid var(--b
 <main>
 <h1>Wash <span>Rate</span></h1>
 <p class="sub">Find a clean toilet near UTMy before you need it.</p>
-<div class="note mut">Prototype: toilets marked “sample” are placeholders. Add real ones with “+ Add toilet”. Data is saved only in this browser.</div>
+<div class="note mut" id="status">Loading…</div>
 <div class="bar" id="views"></div>
 <div class="bar" id="filters"></div>
 <div id="list"></div>
@@ -60,12 +61,19 @@ input[type=text],select,textarea{width:100%;padding:9px;border:1px solid var(--b
 <div id="map"></div>
 <button class="chip" data-near="1">📍 Show my location</button>
 </div>
-<p><button class="btn" id="addBtn">+ Add toilet</button></p>
+<p><button class="btn" id="addBtn">+ Add toilet</button> <button class="chip" data-refresh="1">↻ Refresh</button></p>
 </main>
 <div id="pickbar">Tap the map to place the pin</div>
 <div class="modal" id="modal"><div class="sheet" id="sheet"></div></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <script>
+/* 1) Paste your Supabase values between the quotes (Project Settings > API) */
+var SUPABASE_URL="PASTE_PROJECT_URL_HERE";
+var SUPABASE_KEY="PASTE_ANON_PUBLIC_KEY_HERE";
+/* Map centre: approximate position of UTMy. Change these numbers if the map opens in the wrong place. */
+var CENTER=[3.1729,101.7288];
+
 var LV=[
 {n:5,t:"Spotless",d:"Dry floor, no smell, soap and paper or water available, nothing broken."},
 {n:4,t:"Clean",d:"Tidy and usable, only minor issues (a little water on the floor)."},
@@ -74,15 +82,33 @@ var LV=[
 {n:1,t:"Unusable",d:"Blocked, broken, or very unhygienic. Avoid."}];
 var CK=["Dry floor","Soap available","Paper or water","No bad smell","Door locks"];
 var TYPES=[["m","Men"],["w","Women"],["a","Accessible / unisex"]];
-/* Map centre: approximate position of UTMy. Change these numbers if the map opens in the wrong place. */
-var CENTER=[3.1729,101.7288];
-var store=null;try{store=window.localStorage}catch(e){}
-var S=load(),filter="all",view="list",map=null,layer=null,me=null,first=true,picking=false,cur={};
-function load(){try{var j=store&&store.getItem("washrate");if(j)return JSON.parse(j)}catch(e){}
-return[{id:1,name:"Sample: Campus building, ground floor",type:"m",photo:"",official:4,reviews:[],sample:1,lat:3.1735,lng:101.7280},
-{id:2,name:"Sample: Nearby mall, level 2",type:"w",photo:"",official:3,reviews:[],sample:1,lat:3.1721,lng:101.7297},
-{id:3,name:"Sample: Food court restroom",type:"a",photo:"",official:2,reviews:[],sample:1,lat:3.1727,lng:101.7275}]}
-function save(){try{store&&store.setItem("washrate",JSON.stringify(S))}catch(e){alert("Storage is full. Try a smaller photo.")}}
+var db=null,S=[],filter="all",view="list",map=null,layer=null,me=null,first=true,picking=false,cur={};
+
+function setStatus(t){document.getElementById("status").textContent=t}
+async function start(){
+if(SUPABASE_URL.indexOf("http")!==0||typeof supabase==="undefined"){setStatus("Database not connected yet: paste your Supabase URL and key at the top of the code.");setView("list");return}
+try{
+db=supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
+var s=await db.auth.getSession();
+if(!s.data.session){var a=await db.auth.signInAnonymously();if(a.error)throw a.error}
+await reload()}
+catch(e){setStatus("Could not connect: "+(e.message||e)+". You can still look around, but nothing will be saved.")}
+setView("list")}
+async function reload(){
+var r=await db.from("toilets").select("*, reviews(*)").order("created_at");
+if(r.error){setStatus("Could not load toilets: "+r.error.message);return}
+S=r.data.map(function(t){return{id:t.id,name:t.name,type:t.type,lat:t.lat,lng:t.lng,official:t.official,photo:t.photo_url||"",
+reviews:(t.reviews||[]).map(function(v){return{r:v.rating,checks:v.checks||[],text:v.comment||"",photo:v.photo_url||"",time:new Date(v.created_at).toLocaleString([],{dateStyle:"short",timeStyle:"short"})}})}});
+setStatus(S.length?"Shared data: everyone sees the same toilets and reviews.":"No toilets yet. Tap “+ Add toilet” to add the first one.");
+drawList()}
+async function upload(dataUrl){
+if(!dataUrl)return null;
+var blob=await (await fetch(dataUrl)).blob();
+var name=Date.now()+"-"+Math.random().toString(36).slice(2,8)+".jpg";
+var u=await db.storage.from("photos").upload(name,blob,{contentType:"image/jpeg"});
+if(u.error)throw u.error;
+return db.storage.from("photos").getPublicUrl(name).data.publicUrl}
+
 function avg(t){var a=[t.official];t.reviews.forEach(function(r){a.push(r.r)});return a.reduce(function(x,y){return x+y},0)/a.length}
 function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]})}
 function tl(k){return TYPES.filter(function(x){return x[0]==k})[0][1]}
@@ -94,10 +120,10 @@ TYPES.forEach(function(x){h+='<button class="chip'+(filter==x[0]?' on':'')+'" da
 document.getElementById("filters").innerHTML=h}
 function drawList(){drawBars();var h="";
 S.filter(vis).sort(function(a,b){return avg(b)-avg(a)}).forEach(function(t){
-h+='<div class="card" data-id="'+t.id+'">'+(t.photo?'<img src="'+t.photo+'" alt="">':'<div class="ph"></div>')+
+h+='<div class="card" data-id="'+t.id+'">'+(t.photo?'<img src="'+esc(t.photo)+'" alt="">':'<div class="ph"></div>')+
 '<div><div><b>'+esc(t.name)+'</b></div><div><span class="score">'+avg(t).toFixed(1)+'</span> <span class="mut">/ 5 · '+(t.reviews.length+1)+' ratings</span></div>'+
-'<span class="tag">'+tl(t.type)+'</span> <span class="tag">'+LV[5-Math.round(avg(t))].t+'</span>'+(typeof t.lat=="number"?'':' <span class="tag">no pin</span>')+'</div></div>'});
-document.getElementById("list").innerHTML=h||'<p class="mut">No toilets yet.</p>';
+'<span class="tag">'+tl(t.type)+'</span> <span class="tag">'+LV[5-Math.round(avg(t))].t+'</span></div></div>'});
+document.getElementById("list").innerHTML=h||'<p class="mut">Nothing to show.</p>';
 if(view=="map")drawMap()}
 function initMap(){
 if(map)return;
@@ -113,7 +139,6 @@ function drawMap(){
 initMap();if(!map)return;
 layer.clearLayers();var pts=[];
 S.filter(vis).forEach(function(t){
-if(typeof t.lat!="number")return;
 var a=avg(t),c=a>=4?"#1e9e6a":a>=3?"#d99a00":"#c0392b";
 var ic=L.divIcon({className:"",html:'<div class="pin" style="background:'+c+'">'+a.toFixed(1)+'</div>',iconSize:[34,34],iconAnchor:[17,17]});
 L.marker([t.lat,t.lng],{icon:ic,title:t.name}).on("click",function(){if(!picking)detail(t.id)}).addTo(layer);
@@ -131,53 +156,71 @@ navigator.geolocation.getCurrentPosition(cb,function(){alert("Could not get your
 function show(h){document.getElementById("sheet").innerHTML=h;document.getElementById("modal").classList.add("show")}
 function hide(){document.getElementById("modal").classList.remove("show")}
 function levels(sel){var h="";LV.forEach(function(l){h+='<button type="button" class="lvl'+(sel==l.n?' on':'')+'" data-lv="'+l.n+'"><b>'+l.n+'</b><span><b>'+l.t+'</b><br><span class="mut">'+l.d+'</span></span></button>'});return h}
-function now(){var d=new Date();return d.toLocaleDateString()+" "+d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}
 function detail(id){var t=S.filter(function(x){return x.id==id})[0];if(!t)return;
-var h='<button class="btn ghost" data-close="1">Close</button><h2>'+esc(t.name)+'</h2>'+(t.photo?'<img class="big" src="'+t.photo+'" alt="">':'')+
+var h='<button class="btn ghost" data-close="1">Close</button><h2>'+esc(t.name)+'</h2>'+(t.photo?'<img class="big" src="'+esc(t.photo)+'" alt="">':'')+
 '<p><span class="score">'+avg(t).toFixed(1)+'</span> / 5 · '+tl(t.type)+'<br><span class="mut">Team rating: '+t.official+' / 5 (counts as one rating)</span></p>'+
-'<p><button class="btn" data-rate="'+t.id+'">Rate after use</button> '+
-(typeof t.lat=="number"?'<a class="btn ghost" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination='+t.lat+','+t.lng+'">Directions</a>':'')+'</p><h3>Reviews</h3>';
+'<p><button class="btn" data-rate="'+t.id+'">Rate after use</button> <a class="btn ghost" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination='+t.lat+','+t.lng+'">Directions</a></p><h3>Reviews</h3>';
 if(!t.reviews.length)h+='<p class="mut">No user reviews yet.</p>';
 t.reviews.slice().reverse().forEach(function(r){h+='<div class="rev"><b>'+r.r+' / 5</b> <span class="mut">· '+esc(r.time)+'</span><br>'+esc(r.text||"")+
-(r.checks.length?'<div class="mut">'+r.checks.map(esc).join(" · ")+'</div>':'')+(r.photo?'<br><img src="'+r.photo+'" alt="">':'')+'</div>'});
+(r.checks.length?'<div class="mut">'+r.checks.map(esc).join(" · ")+'</div>':'')+(r.photo?'<br><img src="'+esc(r.photo)+'" alt="">':'')+'</div>'});
 show(h)}
 function rateForm(id){cur={id:id,r:0,photo:"",ck:{}};
 var h='<button class="btn ghost" data-close="1">Cancel</button><h2>Rate this toilet</h2><p class="mut">Pick the level that matches the description.</p>'+levels(0)+
 '<label class="f">What was good?</label>';
 CK.forEach(function(c,i){h+='<button type="button" class="chip" data-ck="'+i+'" style="margin:3px 3px 0 0">'+c+'</button>'});
-h+='<label class="f">Photo after use (optional)</label><input type="file" accept="image/*" id="pf"><label class="f">Review</label><textarea id="rt" rows="3" placeholder="Anything others should know?"></textarea>'+
+h+='<label class="f">Photo after use (optional)</label><input type="file" accept="image/*" id="pf"><label class="f">Review</label><textarea id="rt" rows="3" maxlength="500" placeholder="Anything others should know?"></textarea>'+
 '<p class="mut">Time will be saved automatically.</p><button class="btn" data-sub="1">Submit</button>';
 show(h)}
 function locText(){return typeof cur.lat=="number"?"Location set ✓ ("+cur.lat.toFixed(5)+", "+cur.lng.toFixed(5)+")":"No location yet"}
 function addForm(keep){
 if(!keep)cur={photo:"",r:0};
-var h='<button class="btn ghost" data-close="1">Cancel</button><h2>Add a toilet</h2><label class="f">Name and location</label><input type="text" id="nm" placeholder="e.g. Building A, 1F" value="'+esc(cur.name||"")+'">'+
+var h='<button class="btn ghost" data-close="1">Cancel</button><h2>Add a toilet</h2><label class="f">Name and location</label><input type="text" id="nm" maxlength="120" placeholder="e.g. Building A, 1F" value="'+esc(cur.name||"")+'">'+
 '<label class="f">Type</label><select id="ty">'+TYPES.map(function(x){return'<option value="'+x[0]+'"'+(cur.type==x[0]?' selected':'')+'>'+x[1]+'</option>'}).join("")+'</select>'+
 '<label class="f">Pin on the map</label><button type="button" class="chip" data-geo="1">📍 Use my location</button> <button type="button" class="chip" data-pick="1">🗺 Pick on map</button><div class="mut" id="locst">'+locText()+'</div>'+
 '<label class="f">Photo of the toilet</label><input type="file" accept="image/*" id="pf"><div class="mut" id="phst">'+(cur.photo?"Photo added ✓":"")+'</div><label class="f">Team rating</label>'+levels(cur.r||0)+
 '<button class="btn" data-add="1" style="margin-top:10px">Save toilet</button>';show(h)}
-function shrink(file,cb){var fr=new FileReader();fr.onload=function(){var im=new Image();im.onload=function(){var w=420,k=Math.min(1,w/im.width),c=document.createElement("canvas");
-c.width=im.width*k;c.height=im.height*k;c.getContext("2d").drawImage(im,0,0,c.width,c.height);cb(c.toDataURL("image/jpeg",.6))};im.src=fr.result};fr.readAsDataURL(file)}
+function shrink(file,cb){var fr=new FileReader();fr.onload=function(){var im=new Image();im.onload=function(){var w=800,k=Math.min(1,w/im.width),c=document.createElement("canvas");
+c.width=im.width*k;c.height=im.height*k;c.getContext("2d").drawImage(im,0,0,c.width,c.height);cb(c.toDataURL("image/jpeg",.7))};im.src=fr.result};fr.readAsDataURL(file)}
+async function submitReview(btn){
+if(!cur.r)return alert("Please choose a rating level.");
+if(!db)return alert("The database is not connected yet.");
+btn.disabled=true;btn.textContent="Saving…";
+try{
+var url=await upload(cur.photo);
+var res=await db.from("reviews").insert({toilet_id:cur.id,rating:cur.r,checks:CK.filter(function(c,i){return cur.ck[i]}),comment:document.getElementById("rt").value,photo_url:url});
+if(res.error)throw res.error;
+await reload();detail(cur.id)}
+catch(e){alert("Could not save: "+(e.message||e));btn.disabled=false;btn.textContent="Submit"}}
+async function submitToilet(btn){
+var n=document.getElementById("nm").value.trim();
+if(n.length<2||!cur.r)return alert("Please add a name and a team rating.");
+if(typeof cur.lat!="number")return alert("Please set the location: use your location or pick it on the map.");
+if(!db)return alert("The database is not connected yet.");
+btn.disabled=true;btn.textContent="Saving…";
+try{
+var url=await upload(cur.photo);
+var res=await db.from("toilets").insert({name:n,type:document.getElementById("ty").value,lat:cur.lat,lng:cur.lng,official:cur.r,photo_url:url});
+if(res.error)throw res.error;
+await reload();hide()}
+catch(e){alert("Could not save: "+(e.message||e));btn.disabled=false;btn.textContent="Save toilet"}}
 document.addEventListener("change",function(e){if(e.target.id=="pf"&&e.target.files[0])shrink(e.target.files[0],function(d){cur.photo=d;var p=document.getElementById("phst");if(p)p.textContent="Photo added ✓"})});
 document.addEventListener("click",function(e){var el=e.target.closest("button,.card,.modal");if(!el)return;var d=el.dataset;
 if(el.id=="modal"&&e.target===el)return hide();
 if(d.v)setView(d.v);
 else if(d.f){filter=d.f;drawList()}
+else if(d.refresh){if(db)reload()}
 else if(d.near){locate(function(p){initMap();if(!map)return;var ll=[p.coords.latitude,p.coords.longitude];if(me)map.removeLayer(me);me=L.circleMarker(ll,{radius:8,color:"#fff",weight:2,fillColor:"#2563eb",fillOpacity:1}).addTo(map);map.setView(ll,17)})}
 else if(el.classList.contains("card"))detail(d.id);
 else if(el.id=="addBtn")addForm();
 else if(d.close){picking=false;document.getElementById("pickbar").style.display="none";hide()}
 else if(d.geo){locate(function(p){cur.lat=p.coords.latitude;cur.lng=p.coords.longitude;document.getElementById("locst").textContent=locText()})}
 else if(d.pick){cur.name=document.getElementById("nm").value;cur.type=document.getElementById("ty").value;hide();picking=true;document.getElementById("pickbar").style.display="block";setView("map")}
-else if(d.rate)rateForm(+d.rate);
+else if(d.rate)rateForm(d.rate);
 else if(d.lv){cur.r=+d.lv;document.querySelectorAll(".lvl").forEach(function(b){b.classList.toggle("on",b.dataset.lv==d.lv)})}
 else if(d.ck){var i=d.ck;cur.ck[i]=!cur.ck[i];el.classList.toggle("on",!!cur.ck[i])}
-else if(d.sub){if(!cur.r)return alert("Please choose a rating level.");var t=S.filter(function(x){return x.id==cur.id})[0];
-t.reviews.push({r:cur.r,checks:CK.filter(function(c,i){return cur.ck[i]}),text:document.getElementById("rt").value,photo:cur.photo,time:now()});save();drawList();detail(t.id)}
-else if(d.add){var n=document.getElementById("nm").value.trim();if(!n||!cur.r)return alert("Please add a name and a team rating.");
-if(typeof cur.lat!="number")return alert("Please set the location: use your location or pick it on the map.");
-S.push({id:Date.now(),name:n,type:document.getElementById("ty").value,photo:cur.photo,official:cur.r,reviews:[],lat:cur.lat,lng:cur.lng});save();drawList();hide()}});
-setView("list");
+else if(d.sub)submitReview(el);
+else if(d.add)submitToilet(el)});
+start();
 </script>
 </body>
 </html>
